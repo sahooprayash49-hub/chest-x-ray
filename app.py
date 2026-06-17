@@ -1,10 +1,19 @@
 import streamlit as st
-import tensorflow as tf
 from PIL import Image, ImageOps
 import numpy as np
 import os
-import h5py
 import json
+
+# Conditional imports for TFLite
+try:
+    import tflite_runtime.interpreter as tflite
+    HAS_TFLITE = True
+except ImportError:
+    try:
+        import tensorflow.lite as tflite
+        HAS_TFLITE = True
+    except ImportError:
+        HAS_TFLITE = False
 
 # Set premium page configs
 st.set_page_config(
@@ -194,6 +203,7 @@ div[data-testid="stFileUploader"]:hover {
 
 # Helper function to clean the H5 model config (handles Keras 3 deserialization errors)
 def fix_model_config(input_path, output_path):
+    import h5py
     def clean_config(config):
         if isinstance(config, dict):
             config.pop('quantization_config', None)
@@ -225,9 +235,26 @@ def fix_model_config(input_path, output_path):
 # Cache model loading to avoid reloading on every run
 @st.cache_resource
 def load_pneumonia_model():
+    tflite_model_path = "pneumonia_cnn_model.tflite"
     original_model_path = "pneumonia_cnn_model.h5"
     fixed_model_path = "pneumonia_cnn_model_fixed.h5"
     
+    # 1. Try loading optimized TFLite model first
+    if os.path.exists(tflite_model_path) and HAS_TFLITE:
+        try:
+            interpreter = tflite.Interpreter(model_path=tflite_model_path)
+            interpreter.allocate_tensors()
+            return {"type": "tflite", "interpreter": interpreter}
+        except Exception as e:
+            st.warning(f"Failed to load TFLite model: {e}. Trying Keras model...")
+
+    # 2. Fallback to Keras model loading (requires tensorflow)
+    try:
+        import tensorflow as tf
+    except ImportError:
+        st.error("TensorFlow is not installed, and the TFLite model could not be loaded.")
+        return None
+        
     # Check if the original model exists
     if not os.path.exists(original_model_path):
         st.error(f"Model file '{original_model_path}' not found in the workspace directory. Please make sure it's placed in this directory.")
@@ -236,7 +263,7 @@ def load_pneumonia_model():
     # Try loading the model directly (it might be already cleaned or the environment supports it)
     try:
         model = tf.keras.models.load_model(original_model_path, compile=False)
-        return model
+        return {"type": "keras", "model": model}
     except Exception:
         # If loading original fails (due to quantization_config or other Keras 3 config errors)
         # Use the fixed version if it exists, otherwise fix it
@@ -248,7 +275,7 @@ def load_pneumonia_model():
         
         try:
             model = tf.keras.models.load_model(fixed_model_path, compile=False)
-            return model
+            return {"type": "keras", "model": model}
         except Exception as e:
             st.error(f"Failed to load the model: {e}")
             return None
@@ -314,7 +341,15 @@ with col2:
                 img_array = np.expand_dims(img_array, axis=0)
                 
                 # Make prediction
-                prediction = model.predict(img_array)[0][0]
+                if isinstance(model, dict) and model.get("type") == "tflite":
+                    interpreter = model["interpreter"]
+                    input_details = interpreter.get_input_details()
+                    output_details = interpreter.get_output_details()
+                    interpreter.set_tensor(input_details[0]['index'], img_array)
+                    interpreter.invoke()
+                    prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
+                else:
+                    prediction = model.predict(img_array)[0][0]
                 
                 # In binary classification:
                 # Typically, class 1 = Pneumonia, class 0 = Normal
